@@ -1,0 +1,656 @@
+-- | AirBnb Reservation Application
+-- Demonstrates multi-party agreements using the Propose-Accept pattern in Daml.
+-- Parties: Host (property owner), Guest (traveler), Platform (mediator)
+module Main where
+
+import Daml.Script
+import DA.Date
+
+-- ============================================================================
+-- DATA TYPES
+-- ============================================================================
+
+-- | Represents the current status of a reservation
+data ReservationStatus
+  = Confirmed    -- Reservation has been accepted by the host
+  | CheckedIn    -- Guest has checked in
+  | Completed    -- Guest has checked out
+  | CancelledByGuest
+  | CancelledByHost
+  deriving (Eq, Show)
+
+-- ============================================================================
+-- TEMPLATE: Listing
+-- ============================================================================
+-- | A property listing created by a Host.
+-- The Host is the sole signatory since only they need to authorize creating
+-- their own listing. The platform is an observer so it can display the listing.
+template Listing
+  with
+    host        : Party
+    platform    : Party
+    propertyName : Text
+    location    : Text
+    description : Text
+    pricePerNight : Decimal
+    maxGuests   : Int
+  where
+    signatory host
+    observer platform
+
+    -- Precondition: price must be positive and maxGuests at least 1
+    ensure pricePerNight > 0.0 && maxGuests > 0
+
+    -- Unique key: one listing per host per property name
+    -- key (host, propertyName) : (Party, Text)
+    -- maintainer key._1
+
+    -- | Guest requests a reservation on this listing.
+    -- This is nonconsuming because the listing stays active even when
+    -- a reservation request is made.
+    nonconsuming choice RequestReservation : ContractId ReservationRequest
+      with
+        guest     : Party
+        checkIn   : Date
+        checkOut  : Date
+        numGuests : Int
+      controller guest
+      do
+        -- Validate the request
+        assert (checkIn < checkOut)
+        assert (numGuests > 0 && numGuests <= maxGuests)
+
+        -- Calculate total price based on number of nights
+        let nights = subDate checkOut checkIn
+        let totalPrice = pricePerNight * intToDecimal nights
+
+        -- Create the reservation request (proposal)
+        create ReservationRequest with
+          guest
+          host
+          platform
+          propertyName
+          location
+          checkIn
+          checkOut
+          numGuests
+          totalPrice
+
+    -- | Host can update the price of their listing.
+    choice UpdatePrice : ContractId Listing
+      with
+        newPrice : Decimal
+      controller host
+      do
+        assert (newPrice > 0.0)
+        create this with pricePerNight = newPrice
+
+    -- | Host can delist (archive) their property.
+    choice RemoveListing : ()
+      controller host
+      do
+        return ()
+
+
+-- ============================================================================
+-- TEMPLATE: ReservationRequest (The "Propose" step)
+-- ============================================================================
+-- | A reservation request from a Guest to a Host.
+-- This is the "proposal" in the Propose-Accept pattern.
+-- The Guest is the signatory (they initiated the request).
+-- The Host is an observer (they need to see it to accept/reject).
+template ReservationRequest
+  with
+    guest       : Party
+    host        : Party
+    platform    : Party
+    propertyName : Text
+    location    : Text
+    checkIn     : Date
+    checkOut    : Date
+    numGuests   : Int
+    totalPrice  : Decimal
+  where
+    signatory guest
+    observer host, platform
+
+    -- | Host accepts the reservation request.
+    -- This creates a Reservation contract with BOTH guest and host as
+    -- signatories, forming the multi-party agreement.
+    choice Accept : ContractId Reservation
+      controller host
+      do
+        create Reservation with
+          guest
+          host
+          platform
+          propertyName
+          location
+          checkIn
+          checkOut
+          numGuests
+          totalPrice
+          status = Confirmed
+
+    -- | Host rejects the reservation request.
+    choice Reject : ()
+      controller host
+      do
+        return ()
+
+    -- | Guest withdraws their own request.
+    choice Withdraw : ()
+      controller guest
+      do
+        return ()
+
+
+-- ============================================================================
+-- TEMPLATE: Reservation (The "Accept" result — Multi-Party Agreement!)
+-- ============================================================================
+-- | An active reservation — the core multi-party agreement.
+-- BOTH the Guest and Host are signatories, meaning both parties have
+-- consented to this contract. Neither party was forced into it.
+-- This is the key demonstration of multi-party agreements in Daml.
+template Reservation
+  with
+    guest       : Party
+    host        : Party
+    platform    : Party
+    propertyName : Text
+    location    : Text
+    checkIn     : Date
+    checkOut    : Date
+    numGuests   : Int
+    totalPrice  : Decimal
+    status      : ReservationStatus
+  where
+    signatory guest, host
+    observer platform
+
+    -- Unique key: one active reservation per guest-host-property-checkin combo
+    -- key (guest, host, propertyName, checkIn) : (Party, Party, Text, Date)
+    -- maintainer key._1, key._2
+
+    -- | Guest checks in to the property.
+    choice DoCheckIn : ContractId Reservation
+      controller guest
+      do
+        assert (status == Confirmed)
+        create this with status = CheckedIn
+
+    -- | Guest checks out, completing the stay.
+    -- This archives the reservation and creates a Review opportunity.
+    choice DoCheckOut : (ContractId CompletedStay, ContractId ReviewRequest)
+      controller guest
+      do
+        assert (status == CheckedIn)
+        completedStay <- create CompletedStay with
+          guest
+          host
+          platform
+          propertyName
+          location
+          checkIn
+          checkOut
+          totalPrice
+        reviewReq <- create ReviewRequest with
+          guest
+          host
+          platform
+          propertyName
+        return (completedStay, reviewReq)
+
+    -- | Guest cancels the reservation.
+    choice CancelByGuest : ContractId CancelledReservation
+      controller guest
+      do
+        assert (status == Confirmed)
+        create CancelledReservation with
+          guest
+          host
+          platform
+          propertyName
+          checkIn
+          checkOut
+          totalPrice
+          cancelledBy = guest
+
+    -- | Host cancels the reservation.
+    choice CancelByHost : ContractId CancelledReservation
+      controller host
+      do
+        assert (status == Confirmed)
+        create CancelledReservation with
+          guest
+          host
+          platform
+          propertyName
+          checkIn
+          checkOut
+          totalPrice
+          cancelledBy = host
+
+
+-- ============================================================================
+-- TEMPLATE: CompletedStay
+-- ============================================================================
+-- | Record of a completed stay. Both parties are signatories since
+-- this was derived from a mutually agreed-upon reservation.
+template CompletedStay
+  with
+    guest       : Party
+    host        : Party
+    platform    : Party
+    propertyName : Text
+    location    : Text
+    checkIn     : Date
+    checkOut    : Date
+    totalPrice  : Decimal
+  where
+    signatory guest, host
+    observer platform
+
+
+-- ============================================================================
+-- TEMPLATE: CancelledReservation
+-- ============================================================================
+-- | Record of a cancelled reservation. Both parties are signatories
+-- since the original reservation required mutual consent.
+template CancelledReservation
+  with
+    guest       : Party
+    host        : Party
+    platform    : Party
+    propertyName : Text
+    checkIn     : Date
+    checkOut    : Date
+    totalPrice  : Decimal
+    cancelledBy : Party
+  where
+    signatory guest, host
+    observer platform
+
+
+-- ============================================================================
+-- TEMPLATE: ReviewRequest
+-- ============================================================================
+-- | After checkout, the guest is invited to leave a review.
+-- Only the guest signs this (they decide whether to review).
+template ReviewRequest
+  with
+    guest       : Party
+    host        : Party
+    platform    : Party
+    propertyName : Text
+  where
+    signatory guest, host
+    observer platform
+
+    -- | Guest submits a review.
+    choice SubmitReview : ContractId Review
+      with
+        rating  : Int
+        comment : Text
+      controller guest
+      do
+        assert (rating >= 1 && rating <= 5)
+        create Review with
+          guest
+          host
+          platform
+          propertyName
+          rating
+          comment
+
+    -- | Guest declines to leave a review.
+    choice DeclineReview : ()
+      controller guest
+      do
+        return ()
+
+
+-- ============================================================================
+-- TEMPLATE: Review
+-- ============================================================================
+-- | A guest's review of their stay. The guest is the signatory
+-- (they authored it), and the host is an observer (they can see it).
+template Review
+  with
+    guest       : Party
+    host        : Party
+    platform    : Party
+    propertyName : Text
+    rating      : Int
+    comment     : Text
+  where
+    signatory guest, host
+    observer platform
+
+    ensure rating >= 1 && rating <= 5
+
+-- ============================================================================
+-- SETUP
+-- ============================================================================
+
+setup : Script ()
+setup = script do
+  host     <- allocatePartyWithHint "Alice_Host" (PartyIdHint "Alice_Host")
+  guest    <- allocatePartyWithHint "Bob_Guest" (PartyIdHint "Bob_Guest")
+  platform <- allocatePartyWithHint "AirBnb_Platform" (PartyIdHint "AirBnb_Platform")
+
+  hostId     <- validateUserId "alice_host"
+  guestId    <- validateUserId "bob_guest"
+  platformId <- validateUserId "airbnb_platform"
+
+  createUser (User hostId (Some host)) [CanActAs host, CanReadAs platform]
+  createUser (User guestId (Some guest)) [CanActAs guest, CanReadAs platform]
+  createUser (User platformId (Some platform)) [CanActAs platform]
+
+  -- Create a sample listing
+  submit host do
+    createCmd Listing with
+      host
+      platform
+      propertyName = "Cozy Beach House"
+      location     = "Malibu, CA"
+      description  = "Beautiful beachfront property with ocean views"
+      pricePerNight = 150.0
+      maxGuests    = 4
+
+  return ()
+
+
+-- ============================================================================
+-- TEST SCRIPT: Full Workflow
+-- ============================================================================
+
+-- | Happy path: Host lists property → Guest requests → Host accepts →
+-- Guest checks in → Guest checks out → Guest leaves review
+happyPathTest : Script ()
+happyPathTest = script do
+  -- Step 1: Allocate parties
+  host     <- allocateParty "Alice_Host"
+  guest    <- allocateParty "Bob_Guest"
+  platform <- allocateParty "AirBnb_Platform"
+
+  -- Step 2: Host creates a listing
+  listingCid <- submit host do
+    createCmd Listing with
+      host
+      platform
+      propertyName = "Cozy Beach House"
+      location     = "Malibu, CA"
+      description  = "Beautiful beachfront property with ocean views"
+      pricePerNight = 150.0
+      maxGuests    = 4
+
+  -- Step 3: Guest requests a reservation (the "Propose" step)
+  requestCid <- submitMulti [guest] [platform] do
+    exerciseCmd listingCid RequestReservation with
+      guest
+      checkIn  = date 2026 Mar 15
+      checkOut = date 2026 Mar 20
+      numGuests = 2
+
+  -- Step 4: Host accepts the request (the "Accept" step)
+  -- This creates the multi-party Reservation contract
+  reservationCid <- submit host do
+    exerciseCmd requestCid Accept
+
+  -- Step 5: Guest checks in
+  reservationCid <- submit guest do
+    exerciseCmd reservationCid DoCheckIn
+
+  -- Step 6: Guest checks out
+  (completedStayCid, reviewReqCid) <- submit guest do
+    exerciseCmd reservationCid DoCheckOut
+
+  -- Step 7: Guest leaves a review
+  reviewCid <- submit guest do
+    exerciseCmd reviewReqCid SubmitReview with
+      rating  = 5
+      comment = "Amazing stay! The beach house was perfect."
+
+  return ()
+
+
+-- | Test: Guest cancels a confirmed reservation
+guestCancellationTest : Script ()
+guestCancellationTest = script do
+  host     <- allocateParty "Carol_Host"
+  guest    <- allocateParty "Dave_Guest"
+  platform <- allocateParty "AirBnb_Platform"
+
+  -- Host creates listing
+  listingCid <- submit host do
+    createCmd Listing with
+      host
+      platform
+      propertyName = "Mountain Cabin"
+      location     = "Aspen, CO"
+      description  = "Rustic cabin in the mountains"
+      pricePerNight = 200.0
+      maxGuests    = 6
+
+  -- Guest requests reservation
+  requestCid <- submitMulti [guest] [platform] do
+    exerciseCmd listingCid RequestReservation with
+      guest
+      checkIn  = date 2026 Apr 1
+      checkOut = date 2026 Apr 5
+      numGuests = 3
+
+  -- Host accepts
+  reservationCid <- submit host do
+    exerciseCmd requestCid Accept
+
+  -- Guest cancels
+  cancelledCid <- submit guest do
+    exerciseCmd reservationCid CancelByGuest
+
+  return ()
+
+
+-- | Test: Host rejects a reservation request
+hostRejectionTest : Script ()
+hostRejectionTest = script do
+  host     <- allocateParty "Eve_Host"
+  guest    <- allocateParty "Frank_Guest"
+  platform <- allocateParty "AirBnb_Platform"
+
+  -- Host creates listing
+  listingCid <- submit host do
+    createCmd Listing with
+      host
+      platform
+      propertyName = "City Loft"
+      location     = "New York, NY"
+      description  = "Modern loft in downtown Manhattan"
+      pricePerNight = 300.0
+      maxGuests    = 2
+
+  -- Guest requests reservation
+  requestCid <- submitMulti [guest] [platform] do
+    exerciseCmd listingCid RequestReservation with
+      guest
+      checkIn  = date 2026 May 10
+      checkOut = date 2026 May 12
+      numGuests = 2
+
+  -- Host rejects the request
+  submit host do
+    exerciseCmd requestCid Reject
+
+  return ()
+
+
+-- | Test: Guest withdraws their own request
+guestWithdrawalTest : Script ()
+guestWithdrawalTest = script do
+  host     <- allocateParty "Grace_Host"
+  guest    <- allocateParty "Hank_Guest"
+  platform <- allocateParty "AirBnb_Platform"
+
+  -- Host creates listing
+  listingCid <- submit host do
+    createCmd Listing with
+      host
+      platform
+      propertyName = "Lake House"
+      location     = "Lake Tahoe, NV"
+      description  = "Peaceful lakefront retreat"
+      pricePerNight = 175.0
+      maxGuests    = 5
+
+  -- Guest requests reservation
+  requestCid <- submitMulti [guest] [platform] do
+    exerciseCmd listingCid RequestReservation with
+      guest
+      checkIn  = date 2026 Jun 1
+      checkOut = date 2026 Jun 7
+      numGuests = 4
+
+  -- Guest changes their mind and withdraws
+  submit guest do
+    exerciseCmd requestCid Withdraw
+
+  return ()
+
+
+-- | Test: Host updates listing price
+priceUpdateTest : Script ()
+priceUpdateTest = script do
+  host     <- allocateParty "Ivy_Host"
+  platform <- allocateParty "AirBnb_Platform"
+
+  -- Host creates listing
+  listingCid <- submit host do
+    createCmd Listing with
+      host
+      platform
+      propertyName = "Desert Villa"
+      location     = "Scottsdale, AZ"
+      description  = "Luxury villa with pool"
+      pricePerNight = 250.0
+      maxGuests    = 8
+
+  -- Host updates the price
+  updatedListingCid <- submit host do
+    exerciseCmd listingCid UpdatePrice with
+      newPrice = 275.0
+
+  return ()
+
+
+-- | Test: Validation — invalid reservation requests should fail
+validationTest : Script ()
+validationTest = script do
+  host     <- allocateParty "Jack_Host"
+  guest    <- allocateParty "Kate_Guest"
+  platform <- allocateParty "AirBnb_Platform"
+
+  -- Host creates listing with max 2 guests
+  listingCid <- submit host do
+    createCmd Listing with
+      host
+      platform
+      propertyName = "Tiny Studio"
+      location     = "San Francisco, CA"
+      description  = "Compact studio apartment"
+      pricePerNight = 100.0
+      maxGuests    = 2
+
+  -- Should fail: too many guests (3 > maxGuests of 2)
+  submitMultiMustFail [guest] [platform] do
+    exerciseCmd listingCid RequestReservation with
+      guest
+      checkIn  = date 2026 Jul 1
+      checkOut = date 2026 Jul 3
+      numGuests = 3
+
+  -- Should fail: checkout before checkin
+  submitMultiMustFail [guest] [platform] do
+    exerciseCmd listingCid RequestReservation with
+      guest
+      checkIn  = date 2026 Jul 5
+      checkOut = date 2026 Jul 3
+      numGuests = 1
+
+  -- Should fail: invalid review rating (out of range)
+  -- First, create a valid reservation flow to get a ReviewRequest
+  requestCid <- submitMulti [guest] [platform] do
+    exerciseCmd listingCid RequestReservation with
+      guest
+      checkIn  = date 2026 Jul 10
+      checkOut = date 2026 Jul 12
+      numGuests = 1
+
+  reservationCid <- submit host do
+    exerciseCmd requestCid Accept
+
+  reservationCid <- submit guest do
+    exerciseCmd reservationCid DoCheckIn
+
+  (_, reviewReqCid) <- submit guest do
+    exerciseCmd reservationCid DoCheckOut
+
+  -- Should fail: rating of 6 is out of range (1-5)
+  submitMustFail guest do
+    exerciseCmd reviewReqCid SubmitReview with
+      rating  = 6
+      comment = "Too high rating"
+
+  -- Should succeed: valid rating
+  submit guest do
+    exerciseCmd reviewReqCid SubmitReview with
+      rating  = 4
+      comment = "Nice little studio!"
+
+  return ()
+
+
+-- | Test: Authorization — only the right parties can exercise choices
+authorizationTest : Script ()
+authorizationTest = script do
+  host     <- allocateParty "Leo_Host"
+  guest    <- allocateParty "Mia_Guest"
+  intruder <- allocateParty "Intruder"
+  platform <- allocateParty "AirBnb_Platform"
+
+  -- Host creates listing
+  listingCid <- submit host do
+    createCmd Listing with
+      host
+      platform
+      propertyName = "Penthouse Suite"
+      location     = "Miami, FL"
+      description  = "Luxury penthouse with skyline views"
+      pricePerNight = 500.0
+      maxGuests    = 4
+
+  -- Guest requests reservation
+  requestCid <- submitMulti [guest] [platform] do
+    exerciseCmd listingCid RequestReservation with
+      guest
+      checkIn  = date 2026 Aug 1
+      checkOut = date 2026 Aug 5
+      numGuests = 2
+
+  -- Intruder should NOT be able to accept (only host can)
+  submitMultiMustFail [intruder] [platform] do
+    exerciseCmd requestCid Accept
+
+  -- Intruder should NOT be able to withdraw (only guest can)
+  submitMultiMustFail [intruder] [platform] do
+    exerciseCmd requestCid Withdraw
+
+  -- Host accepts properly
+  reservationCid <- submit host do
+    exerciseCmd requestCid Accept
+
+  -- Intruder should NOT be able to check in (only guest can)
+  submitMultiMustFail [intruder] [platform] do
+    exerciseCmd reservationCid DoCheckIn
+
+  return ()
