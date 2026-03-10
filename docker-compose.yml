@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  # ── DAML Ledger: Sandbox + JSON API ──────────────────────────────────────
+  daml-ledger:
+    build:
+      context: .
+      dockerfile: docker/daml-ledger/Dockerfile
+    container_name: airbnb-daml-ledger
+    ports:
+      - "6865:6865"   # Ledger API (gRPC)
+      - "7575:7575"   # JSON API (HTTP + WebSocket)
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:7575/readyz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  # ── React UI: served by nginx ────────────────────────────────────────────
+  ui:
+    build:
+      context: .
+      dockerfile: docker/ui/Dockerfile
+    container_name: airbnb-ui
+    ports:
+      - "3000:3000"
+    depends_on:
+      daml-ledger:
+        condition: service_healthy
